@@ -1,11 +1,10 @@
 """
-RAG Engine — fully local ONNX embeddings via fastembed, no PyTorch.
+RAG Engine — fully local ONNX embeddings, no PyTorch, no reranker download.
 
 Pipeline:
-  1. Hybrid retrieval: BM25 + fastembed dense (ONNX, ~50MB RAM)
-     merged via Reciprocal Rank Fusion
-  2. Cross-encoder reranking (fastembed ONNX)
-  3. Groq LLM generation
+  1. Hybrid retrieval: BM25 (keyword) + DefaultEmbeddingFunction (ONNX dense)
+     merged via Reciprocal Rank Fusion — top RERANK_TOP_N returned directly
+  2. Groq LLM generation
 """
 
 import logging
@@ -13,13 +12,12 @@ import re
 
 import chromadb
 from chromadb.utils.embedding_functions import DefaultEmbeddingFunction
-from fastembed.rerank.cross_encoder import TextCrossEncoder
 from groq import Groq
 from rank_bm25 import BM25Okapi
 
 from config import (
-    CHROMA_DIR, EMBED_MODEL, COLLECTION_NAME,
-    TOP_K, RERANK_TOP_N, RERANK_MODEL,
+    CHROMA_DIR, COLLECTION_NAME,
+    TOP_K, RERANK_TOP_N,
     GROQ_API_KEY, GROQ_MODEL,
     LLM_TEMPERATURE, LLM_MAX_TOKENS,
 )
@@ -116,7 +114,8 @@ class VectorStore:
             hits.append(chunk)
         return hits
 
-    def retrieve_hybrid(self, query: str, top_k: int = TOP_K) -> list[dict]:
+    def retrieve(self, query: str, top_k: int = TOP_K) -> list[dict]:
+        """Hybrid BM25 + dense via Reciprocal Rank Fusion."""
         dense = self.retrieve_dense(query, top_k=top_k)
         bm25  = self.retrieve_bm25(query, top_k=top_k)
 
@@ -135,14 +134,11 @@ class VectorStore:
                 chunks[key] = hit
 
         results = []
-        for key in sorted(rrf, key=lambda k: rrf[k], reverse=True)[:top_k]:
+        for key in sorted(rrf, key=lambda k: rrf[k], reverse=True)[:RERANK_TOP_N]:
             h = dict(chunks[key])
             h["rrf_score"] = round(rrf[key], 6)
             results.append(h)
         return results
-
-    def retrieve(self, query: str, top_k: int = TOP_K) -> list[dict]:
-        return self.retrieve_hybrid(query, top_k=top_k)
 
     def stats(self) -> dict:
         n = self.collection.count()
@@ -154,33 +150,18 @@ class VectorStore:
 
 
 # ═══════════════════════════════════════════════════════════════
-#  Cross-Encoder Reranker (fastembed ONNX)
+#  Reranker — stub, no model download, just returns top_n
 # ═══════════════════════════════════════════════════════════════
 
 class Reranker:
+    """No-op reranker — RRF in VectorStore already handles ranking."""
+
     def __init__(self):
-        self.model = TextCrossEncoder(model_name=RERANK_MODEL)
-        logger.info("Cross-encoder reranker loaded — %s", RERANK_MODEL)
+        logger.info("Reranker: using RRF (no cross-encoder, saves ~150MB RAM)")
 
     def rerank(self, query: str, hits: list[dict],
                top_n: int = RERANK_TOP_N) -> list[dict]:
-        if not hits:
-            return hits
-        try:
-            docs = [h["text"] for h in hits]
-            scores = list(self.model.rerank(query, docs))
-            ranked = sorted(
-                zip(hits, scores), key=lambda x: x[1], reverse=True
-            )[:top_n]
-            result = []
-            for hit, score in ranked:
-                h = dict(hit)
-                h["rerank_score"] = round(float(score), 4)
-                result.append(h)
-            return result
-        except Exception as e:
-            logger.error("Reranking failed: %s", e)
-            return hits[:top_n]
+        return hits[:top_n]
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -218,9 +199,9 @@ class RAGPipeline:
         if not guard.passed:
             return {"answer": guard.reason, "confidence": 0.0, "guardrail_blocked": True}
 
-        query = guard.sanitized_input
-        hits  = self.vs.retrieve(query, top_k=TOP_K)
-        hits  = self.reranker.rerank(query, hits, top_n=RERANK_TOP_N)
+        query   = guard.sanitized_input
+        hits    = self.vs.retrieve(query, top_k=TOP_K)
+        hits    = self.reranker.rerank(query, hits, top_n=RERANK_TOP_N)
         context = _build_context(hits)
 
         if not self.groq_client:
@@ -250,6 +231,6 @@ class RAGPipeline:
                 "guardrail_blocked": False,
             }
 
-        answer = clean_output(answer)
+        answer     = clean_output(answer)
         confidence = check_grounding(answer, [h["text"] for h in hits])
         return {"answer": answer, "confidence": round(confidence, 2), "guardrail_blocked": False}
