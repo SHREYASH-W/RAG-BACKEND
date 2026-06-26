@@ -68,11 +68,16 @@ class VectorStore:
 
         self._all_chunks: list[dict] = []
         self._bm25: BM25Okapi | None = None
-        if count > 0:
-            self._build_bm25_index()
+        self._bm25_ready = False
+        # BM25 index built lazily on first request to save startup RAM
 
-    def _build_bm25_index(self) -> None:
+    def _ensure_bm25(self) -> None:
+        if self._bm25_ready:
+            return
         n = self.collection.count()
+        if n == 0:
+            self._bm25_ready = True
+            return
         result = self.collection.get(limit=n, include=["documents", "metadatas"])
         self._all_chunks = []
         for doc, meta in zip(result["documents"], result["metadatas"]):
@@ -87,6 +92,7 @@ class VectorStore:
                 "page":     meta.get("page"),
             })
         self._bm25 = BM25Okapi([_tokenize(c["text"]) for c in self._all_chunks])
+        self._bm25_ready = True
         logger.info("BM25 index built — %d chunks", n)
 
     def retrieve_dense(self, query: str, top_k: int = TOP_K) -> list[dict]:
@@ -118,6 +124,7 @@ class VectorStore:
         ]
 
     def retrieve_bm25(self, query: str, top_k: int = TOP_K) -> list[dict]:
+        self._ensure_bm25()
         if not self._bm25 or not self._all_chunks:
             return []
         scores = self._bm25.get_scores(_tokenize(query))
@@ -133,6 +140,7 @@ class VectorStore:
 
     def retrieve(self, query: str, top_k: int = TOP_K) -> list[dict]:
         """Hybrid BM25 + dense via Reciprocal Rank Fusion."""
+        self._ensure_bm25()
         dense = self.retrieve_dense(query, top_k=top_k)
         bm25  = self.retrieve_bm25(query, top_k=top_k)
 
@@ -174,7 +182,7 @@ class Reranker:
     """No-op reranker — RRF in VectorStore already handles ranking."""
 
     def __init__(self):
-        logger.info("Reranker: using RRF (no cross-encoder, saves ~150MB RAM)")
+        logger.info("Reranker ready (RRF-based, no cross-encoder)")
 
     def rerank(self, query: str, hits: list[dict],
                top_n: int = RERANK_TOP_N) -> list[dict]:
