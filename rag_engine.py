@@ -49,6 +49,12 @@ class VectorStore:
         count = self.collection.count()
         logger.info("ChromaDB — collection=%s  chunks=%d", COLLECTION_NAME, count)
 
+        # Pre-warm the ONNX model so the first real query doesn't time out
+        # while downloading 79MB
+        logger.info("Pre-warming ONNX embedding model...")
+        ef(["warmup"])
+        logger.info("ONNX model ready")
+
         self._all_chunks: list[dict] = []
         self._bm25: BM25Okapi | None = None
         if count > 0:
