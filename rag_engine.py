@@ -39,6 +39,11 @@ def _tokenize(text: str) -> list[str]:
 
 class VectorStore:
     def __init__(self):
+        # Point chromadb to bundled ONNX model — no download needed on Render
+        import os
+        bundled = str(CHROMA_DIR.parent / "onnx_models")
+        os.environ.setdefault("CHROMA_CACHE_DIR", bundled)
+
         ef = DefaultEmbeddingFunction()
         self.client = chromadb.PersistentClient(path=str(CHROMA_DIR))
         self.collection = self.client.get_or_create_collection(
