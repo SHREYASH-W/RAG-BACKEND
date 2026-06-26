@@ -1,20 +1,24 @@
 """
-RAG Engine — fully local ONNX embeddings, no PyTorch, no reranker download.
+RAG Engine — local ONNX dense search + SQLite FTS5 keyword search.
+
+No in-memory BM25 index — FTS5 queries go directly to ChromaDB's SQLite file.
+This keeps startup RAM under 200MB on Render free tier.
 
 Pipeline:
-  1. Hybrid retrieval: BM25 (keyword) + DefaultEmbeddingFunction (ONNX dense)
-     merged via Reciprocal Rank Fusion — top RERANK_TOP_N returned directly
-  2. Groq LLM generation
+  1. Dense: ChromaDB ONNX (DefaultEmbeddingFunction, all-MiniLM-L6-v2)
+  2. FTS5: SQLite full-text search on chroma.sqlite3
+  3. Merge via Reciprocal Rank Fusion
+  4. Groq LLM generation
 """
 
 import logging
 import re
+import sqlite3
 from pathlib import Path
 
 import chromadb
 from chromadb.utils.embedding_functions import DefaultEmbeddingFunction
 from groq import Groq
-from rank_bm25 import BM25Okapi
 
 from config import (
     CHROMA_DIR, COLLECTION_NAME,
@@ -28,10 +32,7 @@ from guardrails import check_input, clean_output, check_grounding
 logger = logging.getLogger(__name__)
 
 RRF_K = 60
-
-
-def _tokenize(text: str) -> list[str]:
-    return re.sub(r"[^\w\s]", " ", text.lower()).split()
+SQLITE_PATH = CHROMA_DIR / "chroma.sqlite3"
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -40,61 +41,31 @@ def _tokenize(text: str) -> list[str]:
 
 class VectorStore:
     def __init__(self):
-        # Pre-populate chromadb's hardcoded cache path from bundled model
-        # so it never needs to download from S3 (avoids cold-start timeout)
-        import os, shutil
+        # Copy bundled ONNX model to chromadb's hardcoded cache dir
+        import shutil
         bundled = CHROMA_DIR.parent / "onnx_models" / "all-MiniLM-L6-v2"
         cache   = Path.home() / ".cache" / "chroma" / "onnx_models" / "all-MiniLM-L6-v2"
         if bundled.exists() and not cache.exists():
             logger.info("Copying bundled ONNX model to cache...")
             shutil.copytree(str(bundled), str(cache))
-            logger.info("ONNX model copied to cache")
+            logger.info("ONNX model copied")
 
-        ef = DefaultEmbeddingFunction()
+        self._ef = DefaultEmbeddingFunction()
         self.client = chromadb.PersistentClient(path=str(CHROMA_DIR))
         self.collection = self.client.get_or_create_collection(
             name=COLLECTION_NAME,
-            embedding_function=ef,
+            embedding_function=self._ef,
             metadata={"hnsw:space": "cosine"},
         )
         count = self.collection.count()
         logger.info("ChromaDB — collection=%s  chunks=%d", COLLECTION_NAME, count)
 
-        # Pre-warm the ONNX model so the first real query doesn't time out
-        # while downloading 79MB
-        logger.info("Pre-warming ONNX embedding model...")
-        ef(["warmup"])
+        # Pre-warm ONNX model
+        logger.info("Pre-warming ONNX model...")
+        self._ef(["warmup"])
         logger.info("ONNX model ready")
 
-        self._all_chunks: list[dict] = []
-        self._bm25: BM25Okapi | None = None
-        self._bm25_ready = False
-        # BM25 index built lazily on first request to save startup RAM
-
-    def _ensure_bm25(self) -> None:
-        if self._bm25_ready:
-            return
-        n = self.collection.count()
-        if n == 0:
-            self._bm25_ready = True
-            return
-        result = self.collection.get(limit=n, include=["documents", "metadatas"])
-        self._all_chunks = []
-        for doc, meta in zip(result["documents"], result["metadatas"]):
-            self._all_chunks.append({
-                "text":     doc,
-                "source":   meta.get("source"),
-                "act_name": meta.get("act_name"),
-                "part":     meta.get("part"),
-                "chapter":  meta.get("chapter"),
-                "article":  meta.get("article"),
-                "section":  meta.get("section"),
-                "page":     meta.get("page"),
-            })
-        self._bm25 = BM25Okapi([_tokenize(c["text"]) for c in self._all_chunks])
-        self._bm25_ready = True
-        logger.info("BM25 index built — %d chunks", n)
-
+    # ── Dense retrieval ────────────────────────────────────────
     def retrieve_dense(self, query: str, top_k: int = TOP_K) -> list[dict]:
         count = self.collection.count()
         if count == 0:
@@ -123,26 +94,79 @@ class VectorStore:
             )
         ]
 
-    def retrieve_bm25(self, query: str, top_k: int = TOP_K) -> list[dict]:
-        self._ensure_bm25()
-        if not self._bm25 or not self._all_chunks:
+    # ── FTS5 keyword retrieval ─────────────────────────────────
+    def retrieve_fts(self, query: str, top_k: int = TOP_K) -> list[dict]:
+        """Full-text search using ChromaDB's built-in SQLite FTS5 index."""
+        if not SQLITE_PATH.exists():
             return []
-        scores = self._bm25.get_scores(_tokenize(query))
-        scored = sorted(enumerate(scores), key=lambda x: x[1], reverse=True)[:top_k]
-        hits = []
-        for idx, score in scored:
-            if score == 0:
-                break
-            chunk = dict(self._all_chunks[idx])
-            chunk["bm25_score"] = round(float(score), 4)
-            hits.append(chunk)
-        return hits
+        try:
+            # Sanitize query for FTS5 (escape special chars)
+            fts_query = re.sub(r'[^\w\s]', ' ', query).strip()
+            if not fts_query:
+                return []
 
+            conn = sqlite3.connect(str(SQLITE_PATH))
+            cur  = conn.cursor()
+
+            # FTS5 match query — returns rowids ranked by relevance
+            cur.execute(
+                """
+                SELECT c.rowid, c.c0, rank
+                FROM embedding_fulltext_search f
+                JOIN embedding_fulltext_search_content c ON c.rowid = f.rowid
+                WHERE embedding_fulltext_search MATCH ?
+                ORDER BY rank
+                LIMIT ?
+                """,
+                (fts_query, top_k),
+            )
+            rows = cur.fetchall()
+
+            if not rows:
+                conn.close()
+                return []
+
+            # Get metadata for matched rows via embedding_id
+            hits = []
+            for rowid, doc_text, rank in rows:
+                # Get the embedding_id for this rowid
+                cur.execute(
+                    "SELECT embedding_id FROM embeddings WHERE id = ?", (rowid,)
+                )
+                emb_row = cur.fetchone()
+                if not emb_row:
+                    continue
+                emb_id = emb_row[0]
+
+                # Get metadata for this embedding
+                cur.execute(
+                    "SELECT key, string_value FROM embedding_metadata WHERE id = "
+                    "(SELECT id FROM embeddings WHERE embedding_id = ?)",
+                    (emb_id,),
+                )
+                meta = {r[0]: r[1] for r in cur.fetchall()}
+                hits.append({
+                    "text":     doc_text,
+                    "source":   meta.get("source"),
+                    "act_name": meta.get("act_name"),
+                    "part":     meta.get("part"),
+                    "chapter":  meta.get("chapter"),
+                    "article":  meta.get("article"),
+                    "section":  meta.get("section"),
+                    "page":     meta.get("page"),
+                    "fts_rank": float(rank) if rank else 0.0,
+                })
+
+            conn.close()
+            return hits
+        except Exception as e:
+            logger.warning("FTS search failed: %s", e)
+            return []
+
+    # ── Hybrid RRF ─────────────────────────────────────────────
     def retrieve(self, query: str, top_k: int = TOP_K) -> list[dict]:
-        """Hybrid BM25 + dense via Reciprocal Rank Fusion."""
-        self._ensure_bm25()
         dense = self.retrieve_dense(query, top_k=top_k)
-        bm25  = self.retrieve_bm25(query, top_k=top_k)
+        fts   = self.retrieve_fts(query, top_k=top_k)
 
         rrf: dict[str, float] = {}
         chunks: dict[str, dict] = {}
@@ -152,7 +176,7 @@ class VectorStore:
             rrf[key] = rrf.get(key, 0.0) + 1.0 / (RRF_K + rank + 1)
             chunks[key] = hit
 
-        for rank, hit in enumerate(bm25):
+        for rank, hit in enumerate(fts):
             key = hit["text"][:120]
             rrf[key] = rrf.get(key, 0.0) + 1.0 / (RRF_K + rank + 1)
             if key not in chunks:
@@ -163,6 +187,8 @@ class VectorStore:
             h = dict(chunks[key])
             h["rrf_score"] = round(rrf[key], 6)
             results.append(h)
+
+        logger.debug("Hybrid — dense=%d fts=%d merged=%d", len(dense), len(fts), len(results))
         return results
 
     def stats(self) -> dict:
@@ -175,14 +201,12 @@ class VectorStore:
 
 
 # ═══════════════════════════════════════════════════════════════
-#  Reranker — stub, no model download, just returns top_n
+#  Reranker (no-op, RRF handles ranking)
 # ═══════════════════════════════════════════════════════════════
 
 class Reranker:
-    """No-op reranker — RRF in VectorStore already handles ranking."""
-
     def __init__(self):
-        logger.info("Reranker ready (RRF-based, no cross-encoder)")
+        logger.info("Reranker ready (RRF)")
 
     def rerank(self, query: str, hits: list[dict],
                top_n: int = RERANK_TOP_N) -> list[dict]:
@@ -230,11 +254,7 @@ class RAGPipeline:
         context = _build_context(hits)
 
         if not self.groq_client:
-            return {
-                "answer": "⚠️ GROQ_API_KEY is not configured.",
-                "confidence": 0.0,
-                "guardrail_blocked": False,
-            }
+            return {"answer": "⚠️ GROQ_API_KEY not configured.", "confidence": 0.0, "guardrail_blocked": False}
 
         user_prompt = build_answer_prompt(query, context, chat_history)
         try:
@@ -250,11 +270,7 @@ class RAGPipeline:
             answer = response.choices[0].message.content
         except Exception as e:
             logger.error("LLM failed: %s", e)
-            return {
-                "answer": "I encountered an error. Please try again.",
-                "confidence": 0.0,
-                "guardrail_blocked": False,
-            }
+            return {"answer": "I encountered an error. Please try again.", "confidence": 0.0, "guardrail_blocked": False}
 
         answer     = clean_output(answer)
         confidence = check_grounding(answer, [h["text"] for h in hits])

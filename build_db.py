@@ -1,7 +1,6 @@
 """
-Build ChromaDB vector database from all files in the data directory.
-Uses fastembed (ONNX) — no PyTorch, no API keys, no rate limits.
-Resume-safe: skips files already ingested by file hash.
+Build ChromaDB vector database using local ONNX embeddings (DefaultEmbeddingFunction).
+No API keys, no rate limits. Resume-safe.
 """
 import logging
 from pathlib import Path
@@ -10,7 +9,7 @@ from dotenv import load_dotenv
 import chromadb
 from chromadb.utils.embedding_functions import DefaultEmbeddingFunction
 
-from config import CHROMA_DIR, DATA_DIR, COLLECTION_NAME, EMBED_MODEL
+from config import CHROMA_DIR, DATA_DIR, COLLECTION_NAME
 from chunker import chunk_pdf, chunk_json, file_hash
 
 load_dotenv()
@@ -69,7 +68,7 @@ def ingest_file(collection, filepath: Path) -> int:
 
 
 def build_database():
-    logger.info("Loading DefaultEmbeddingFunction (ONNX all-MiniLM-L6-v2)")
+    logger.info("Loading DefaultEmbeddingFunction (ONNX all-MiniLM-L6-v2)...")
     ef = DefaultEmbeddingFunction()
 
     client = chromadb.PersistentClient(path=str(CHROMA_DIR))
@@ -108,7 +107,7 @@ def build_database():
     for filepath in priority_paths + remaining:
         total += ingest_file(collection, filepath)
 
-    logger.info("Done. %d chunks added. Total in DB: %d", total, collection.count())
+    logger.info("Done. %d chunks added. Total: %d", total, collection.count())
 
 
 if __name__ == "__main__":

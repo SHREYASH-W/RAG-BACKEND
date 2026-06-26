@@ -1,6 +1,8 @@
 """
 Configuration for the Indian Law RAG backend.
-Fully local ONNX-based embeddings via fastembed — no PyTorch, ~50MB RAM.
+Embeddings: local ONNX (DefaultEmbeddingFunction, all-MiniLM-L6-v2, 384-dim).
+Keyword search: SQLite FTS5 (built into ChromaDB's sqlite file, zero extra RAM).
+LLM: Groq llama-3.3-70b-versatile.
 """
 import os
 from pathlib import Path
@@ -13,13 +15,6 @@ BASE_DIR   = Path(__file__).resolve().parent
 CHROMA_DIR = BASE_DIR / "chroma_db"
 DATA_DIR   = BASE_DIR / "data"
 
-# ── Local Embedding Model (fastembed / ONNX) ───────────────────
-# BAAI/bge-small-en-v1.5: ~25MB, 384-dim, excellent quality, ONNX
-EMBED_MODEL = "BAAI/bge-small-en-v1.5"
-
-# ── Local Cross-Encoder Reranker (fastembed / ONNX) ────────────
-RERANK_MODEL = "cross-encoder/ms-marco-MiniLM-L-6-v2"
-
 # ── ChromaDB ───────────────────────────────────────────────────
 COLLECTION_NAME = "indian_law"
 
@@ -31,8 +26,10 @@ CHUNK_OVERLAP = 75
 TOP_K        = 15
 RERANK_TOP_N = 5
 
+# ── API Keys ───────────────────────────────────────────────────
+GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
+
 # ── LLM ────────────────────────────────────────────────────────
-GROQ_API_KEY    = os.getenv("GROQ_API_KEY", "")
 GROQ_MODEL      = "llama-3.3-70b-versatile"
 LLM_TEMPERATURE = 0.2
 LLM_MAX_TOKENS  = 2000
