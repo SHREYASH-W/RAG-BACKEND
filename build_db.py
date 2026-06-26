@@ -78,25 +78,30 @@ def build_database():
             metas.append(meta)
 
         import time
-        # Batch upsert - small batch to respect trial rate limits
-        batch_size = 50
+        # Batch upsert — conservative for Cohere trial (40 calls/day limit)
+        batch_size = 25
         for i in range(0, len(ids), batch_size):
-            try:
-                collection.add(
-                    ids=ids[i:i + batch_size],
-                    documents=docs[i:i + batch_size],
-                    metadatas=metas[i:i + batch_size],
-                )
-                time.sleep(2)  # Delay to prevent rate limits
-            except Exception as e:
-                logger.error(f"Rate limit or error: {e}")
-                time.sleep(10)
-                # Retry once
-                collection.add(
-                    ids=ids[i:i + batch_size],
-                    documents=docs[i:i + batch_size],
-                    metadatas=metas[i:i + batch_size],
-                )
+            retries = 0
+            while retries < 5:
+                try:
+                    collection.add(
+                        ids=ids[i:i + batch_size],
+                        documents=docs[i:i + batch_size],
+                        metadatas=metas[i:i + batch_size],
+                    )
+                    time.sleep(65)  # 65s between calls — safe for trial limits
+                    break
+                except Exception as e:
+                    retries += 1
+                    wait = 60 * retries
+                    logger.warning(
+                        f"Rate limit/error (attempt {retries}): {e}. "
+                        f"Waiting {wait}s..."
+                    )
+                    time.sleep(wait)
+            else:
+                logger.error(f"Failed batch {i} after 5 retries. Stopping.")
+                return
             
         logger.info(f"Added {len(ids)} chunks from {filepath.name}")
         total_added += len(ids)
