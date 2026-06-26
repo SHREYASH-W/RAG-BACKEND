@@ -9,6 +9,7 @@ Pipeline:
 
 import logging
 import re
+from pathlib import Path
 
 import chromadb
 from chromadb.utils.embedding_functions import DefaultEmbeddingFunction
@@ -39,10 +40,15 @@ def _tokenize(text: str) -> list[str]:
 
 class VectorStore:
     def __init__(self):
-        # Point chromadb to bundled ONNX model — no download needed on Render
-        import os
-        bundled = str(CHROMA_DIR.parent / "onnx_models")
-        os.environ.setdefault("CHROMA_CACHE_DIR", bundled)
+        # Pre-populate chromadb's hardcoded cache path from bundled model
+        # so it never needs to download from S3 (avoids cold-start timeout)
+        import os, shutil
+        bundled = CHROMA_DIR.parent / "onnx_models" / "all-MiniLM-L6-v2"
+        cache   = Path.home() / ".cache" / "chroma" / "onnx_models" / "all-MiniLM-L6-v2"
+        if bundled.exists() and not cache.exists():
+            logger.info("Copying bundled ONNX model to cache...")
+            shutil.copytree(str(bundled), str(cache))
+            logger.info("ONNX model copied to cache")
 
         ef = DefaultEmbeddingFunction()
         self.client = chromadb.PersistentClient(path=str(CHROMA_DIR))
