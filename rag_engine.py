@@ -1,17 +1,19 @@
 """
 RAG Engine — Vector store (query-only), reranker, and the full RAG pipeline.
 
-Optimized for static deployment: no ingestion, no BM25, no query expansion.
-Uses Cohere for embeddings + reranking, Groq for LLM generation.
+Uses hybrid retrieval: BM25 (keyword) + Cohere dense embeddings, merged via
+Reciprocal Rank Fusion, then reranked by Cohere for final precision.
 """
 
 import logging
+import re
 from pathlib import Path
 
 import chromadb
 from chromadb.utils import embedding_functions
 import cohere
 from groq import Groq
+from rank_bm25 import BM25Okapi
 
 from config import (
     CHROMA_DIR, EMBED_MODEL, COLLECTION_NAME,
@@ -23,6 +25,14 @@ from prompts import SYSTEM_PROMPT, build_answer_prompt
 from guardrails import check_input, clean_output, check_grounding
 
 logger = logging.getLogger(__name__)
+
+# ── RRF constant (60 is standard; higher = smoother rank blending) ──
+RRF_K = 60
+
+
+def _tokenize(text: str) -> list[str]:
+    """Lowercase, strip punctuation, split into tokens for BM25."""
+    return re.sub(r"[^\w\s]", " ", text.lower()).split()
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -43,14 +53,44 @@ class VectorStore:
             embedding_function=ef,
             metadata={"hnsw:space": "cosine"},
         )
+        count = self.collection.count()
         logger.info(
             "ChromaDB loaded — collection=%s chunks=%d",
             COLLECTION_NAME,
-            self.collection.count(),
+            count,
         )
 
-    def retrieve(self, query: str, top_k: int = TOP_K) -> list[dict]:
-        """Retrieve top-K chunks via cosine similarity."""
+        # ── Build BM25 index from all stored chunks ────────────
+        self._all_chunks: list[dict] = []
+        self._bm25: BM25Okapi | None = None
+        if count > 0:
+            self._build_bm25_index()
+
+    def _build_bm25_index(self) -> None:
+        """Load all chunks from ChromaDB and build an in-memory BM25 index."""
+        n = self.collection.count()
+        result = self.collection.get(
+            limit=n,
+            include=["documents", "metadatas"],
+        )
+        self._all_chunks = []
+        for doc, meta in zip(result["documents"], result["metadatas"]):
+            self._all_chunks.append({
+                "text": doc,
+                "source": meta.get("source"),
+                "act_name": meta.get("act_name"),
+                "part": meta.get("part"),
+                "chapter": meta.get("chapter"),
+                "article": meta.get("article"),
+                "section": meta.get("section"),
+                "page": meta.get("page"),
+            })
+        tokenized = [_tokenize(c["text"]) for c in self._all_chunks]
+        self._bm25 = BM25Okapi(tokenized)
+        logger.info("BM25 index built — %d chunks", n)
+
+    def retrieve_dense(self, query: str, top_k: int = TOP_K) -> list[dict]:
+        """Retrieve top-K chunks via Cohere cosine similarity."""
         count = self.collection.count()
         if count == 0:
             return []
@@ -79,6 +119,69 @@ class VectorStore:
                 "score": round(1 - dist, 4),
             })
         return hits
+
+    def retrieve_bm25(self, query: str, top_k: int = TOP_K) -> list[dict]:
+        """Retrieve top-K chunks via BM25 keyword scoring."""
+        if not self._bm25 or not self._all_chunks:
+            return []
+
+        tokens = _tokenize(query)
+        scores = self._bm25.get_scores(tokens)
+
+        # Pair each chunk with its BM25 score and sort descending
+        scored = sorted(
+            enumerate(scores), key=lambda x: x[1], reverse=True
+        )[:top_k]
+
+        hits = []
+        for idx, score in scored:
+            if score == 0:
+                break  # skip zero-score results
+            chunk = dict(self._all_chunks[idx])
+            chunk["bm25_score"] = round(float(score), 4)
+            hits.append(chunk)
+        return hits
+
+    def retrieve_hybrid(self, query: str, top_k: int = TOP_K) -> list[dict]:
+        """
+        Hybrid retrieval: merge BM25 + dense results using Reciprocal Rank
+        Fusion, return top_k unique chunks.
+        """
+        dense_hits = self.retrieve_dense(query, top_k=top_k)
+        bm25_hits = self.retrieve_bm25(query, top_k=top_k)
+
+        # RRF: score each chunk based on its rank in each list
+        rrf_scores: dict[str, float] = {}
+        chunk_map: dict[str, dict] = {}
+
+        for rank, hit in enumerate(dense_hits):
+            key = hit["text"][:100]  # use text prefix as dedup key
+            rrf_scores[key] = rrf_scores.get(key, 0.0) + 1.0 / (RRF_K + rank + 1)
+            chunk_map[key] = hit
+
+        for rank, hit in enumerate(bm25_hits):
+            key = hit["text"][:100]
+            rrf_scores[key] = rrf_scores.get(key, 0.0) + 1.0 / (RRF_K + rank + 1)
+            if key not in chunk_map:
+                chunk_map[key] = hit
+
+        # Sort by combined RRF score
+        sorted_keys = sorted(rrf_scores, key=lambda k: rrf_scores[k], reverse=True)
+        results = []
+        for key in sorted_keys[:top_k]:
+            hit = dict(chunk_map[key])
+            hit["rrf_score"] = round(rrf_scores[key], 6)
+            results.append(hit)
+
+        logger.debug(
+            "Hybrid retrieval — dense=%d bm25=%d merged=%d",
+            len(dense_hits), len(bm25_hits), len(results),
+        )
+        return results
+
+    # Keep old method name as alias for backward compatibility
+    def retrieve(self, query: str, top_k: int = TOP_K) -> list[dict]:
+        return self.retrieve_hybrid(query, top_k=top_k)
 
     def stats(self) -> dict:
         """Return knowledge-base statistics."""
