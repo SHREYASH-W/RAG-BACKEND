@@ -1,6 +1,6 @@
 """
 Build ChromaDB vector database from all files in the data directory.
-Uses local sentence-transformers — no API keys, no rate limits.
+Uses fastembed (ONNX) — no PyTorch, no API keys, no rate limits.
 Resume-safe: skips files already ingested by file hash.
 """
 import logging
@@ -8,7 +8,7 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 import chromadb
-from chromadb.utils.embedding_functions import SentenceTransformerEmbeddingFunction
+from chromadb.utils.embedding_functions import DefaultEmbeddingFunction
 
 from config import CHROMA_DIR, DATA_DIR, COLLECTION_NAME, EMBED_MODEL
 from chunker import chunk_pdf, chunk_json, file_hash
@@ -21,24 +21,18 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-BATCH_SIZE = 200  # local embeddings — no rate limit, use large batches
+BATCH_SIZE = 200
 
 
 def ingest_file(collection, filepath: Path) -> int:
     md5 = file_hash(filepath)
-    existing = collection.get(where={"pdf_hash": md5}, limit=1)
-    if existing["ids"]:
+    if collection.get(where={"pdf_hash": md5}, limit=1)["ids"]:
         logger.info("SKIP  %s", filepath.name)
         return 0
 
     logger.info("START %s", filepath.name)
     ext = filepath.suffix.lower()
-    if ext == ".pdf":
-        chunks = chunk_pdf(filepath)
-    elif ext == ".json":
-        chunks = chunk_json(filepath)
-    else:
-        return 0
+    chunks = chunk_pdf(filepath) if ext == ".pdf" else chunk_json(filepath) if ext == ".json" else []
 
     if not chunks:
         logger.warning("EMPTY %s", filepath.name)
@@ -75,14 +69,10 @@ def ingest_file(collection, filepath: Path) -> int:
 
 
 def build_database():
-    logger.info("Loading local embedding model: %s", EMBED_MODEL)
-    ef = SentenceTransformerEmbeddingFunction(
-        model_name=EMBED_MODEL,
-        device="cpu",
-    )
-    client = chromadb.PersistentClient(path=str(CHROMA_DIR))
+    logger.info("Loading DefaultEmbeddingFunction (ONNX all-MiniLM-L6-v2)")
+    ef = DefaultEmbeddingFunction()
 
-    # Delete existing collection so we start clean with new embedding model
+    client = chromadb.PersistentClient(path=str(CHROMA_DIR))
     try:
         client.delete_collection(COLLECTION_NAME)
         logger.info("Deleted old collection")
@@ -94,9 +84,7 @@ def build_database():
         embedding_function=ef,
         metadata={"hnsw:space": "cosine"},
     )
-    logger.info("DB starts with %d chunks", collection.count())
 
-    # Priority: statute PDFs first, then JSON case files
     priority = [
         "constitution_of_india.pdf",
         "the_bharatiya_nagarik_suraksha_sanhita,_2023.pdf",
@@ -116,13 +104,11 @@ def build_database():
         key=lambda f: f.name,
     )
 
-    total_added = 0
+    total = 0
     for filepath in priority_paths + remaining:
-        total_added += ingest_file(collection, filepath)
+        total += ingest_file(collection, filepath)
 
-    logger.info("=" * 60)
-    logger.info("Done. Added %d chunks this run.", total_added)
-    logger.info("Total in DB: %d", collection.count())
+    logger.info("Done. %d chunks added. Total in DB: %d", total, collection.count())
 
 
 if __name__ == "__main__":

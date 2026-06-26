@@ -1,19 +1,19 @@
 """
-RAG Engine — fully local, no external embedding/reranking APIs.
+RAG Engine — fully local ONNX embeddings via fastembed, no PyTorch.
 
 Pipeline:
-  1. Hybrid retrieval: BM25 (keyword) + sentence-transformers (dense)
+  1. Hybrid retrieval: BM25 + fastembed dense (ONNX, ~50MB RAM)
      merged via Reciprocal Rank Fusion
-  2. Cross-encoder reranking (local, ms-marco-MiniLM-L-6-v2)
-  3. Groq LLM generation (only external call)
+  2. Cross-encoder reranking (fastembed ONNX)
+  3. Groq LLM generation
 """
 
 import logging
 import re
 
 import chromadb
-from chromadb.utils.embedding_functions import SentenceTransformerEmbeddingFunction
-from sentence_transformers import CrossEncoder
+from chromadb.utils.embedding_functions import DefaultEmbeddingFunction
+from fastembed.rerank.cross_encoder import TextCrossEncoder
 from groq import Groq
 from rank_bm25 import BM25Okapi
 
@@ -28,11 +28,10 @@ from guardrails import check_input, clean_output, check_grounding
 
 logger = logging.getLogger(__name__)
 
-RRF_K = 60  # Reciprocal Rank Fusion constant
+RRF_K = 60
 
 
 def _tokenize(text: str) -> list[str]:
-    """Lowercase, strip punctuation, split for BM25."""
     return re.sub(r"[^\w\s]", " ", text.lower()).split()
 
 
@@ -41,13 +40,8 @@ def _tokenize(text: str) -> list[str]:
 # ═══════════════════════════════════════════════════════════════
 
 class VectorStore:
-    """ChromaDB collection with local sentence-transformer embeddings."""
-
     def __init__(self):
-        ef = SentenceTransformerEmbeddingFunction(
-            model_name=EMBED_MODEL,
-            device="cpu",
-        )
+        ef = DefaultEmbeddingFunction()
         self.client = chromadb.PersistentClient(path=str(CHROMA_DIR))
         self.collection = self.client.get_or_create_collection(
             name=COLLECTION_NAME,
@@ -77,8 +71,7 @@ class VectorStore:
                 "section":  meta.get("section"),
                 "page":     meta.get("page"),
             })
-        tokenized = [_tokenize(c["text"]) for c in self._all_chunks]
-        self._bm25 = BM25Okapi(tokenized)
+        self._bm25 = BM25Okapi([_tokenize(c["text"]) for c in self._all_chunks])
         logger.info("BM25 index built — %d chunks", n)
 
     def retrieve_dense(self, query: str, top_k: int = TOP_K) -> list[dict]:
@@ -90,13 +83,8 @@ class VectorStore:
             n_results=min(top_k, count),
             include=["documents", "metadatas", "distances"],
         )
-        hits = []
-        for doc, meta, dist in zip(
-            results["documents"][0],
-            results["metadatas"][0],
-            results["distances"][0],
-        ):
-            hits.append({
+        return [
+            {
                 "text":     doc,
                 "source":   meta.get("source"),
                 "act_name": meta.get("act_name"),
@@ -106,8 +94,13 @@ class VectorStore:
                 "section":  meta.get("section"),
                 "page":     meta.get("page"),
                 "score":    round(1 - dist, 4),
-            })
-        return hits
+            }
+            for doc, meta, dist in zip(
+                results["documents"][0],
+                results["metadatas"][0],
+                results["distances"][0],
+            )
+        ]
 
     def retrieve_bm25(self, query: str, top_k: int = TOP_K) -> list[dict]:
         if not self._bm25 or not self._all_chunks:
@@ -124,32 +117,28 @@ class VectorStore:
         return hits
 
     def retrieve_hybrid(self, query: str, top_k: int = TOP_K) -> list[dict]:
-        """BM25 + dense → Reciprocal Rank Fusion."""
-        dense_hits = self.retrieve_dense(query, top_k=top_k)
-        bm25_hits  = self.retrieve_bm25(query, top_k=top_k)
+        dense = self.retrieve_dense(query, top_k=top_k)
+        bm25  = self.retrieve_bm25(query, top_k=top_k)
 
-        rrf_scores: dict[str, float] = {}
-        chunk_map:  dict[str, dict]  = {}
+        rrf: dict[str, float] = {}
+        chunks: dict[str, dict] = {}
 
-        for rank, hit in enumerate(dense_hits):
+        for rank, hit in enumerate(dense):
             key = hit["text"][:120]
-            rrf_scores[key] = rrf_scores.get(key, 0.0) + 1.0 / (RRF_K + rank + 1)
-            chunk_map[key] = hit
+            rrf[key] = rrf.get(key, 0.0) + 1.0 / (RRF_K + rank + 1)
+            chunks[key] = hit
 
-        for rank, hit in enumerate(bm25_hits):
+        for rank, hit in enumerate(bm25):
             key = hit["text"][:120]
-            rrf_scores[key] = rrf_scores.get(key, 0.0) + 1.0 / (RRF_K + rank + 1)
-            if key not in chunk_map:
-                chunk_map[key] = hit
+            rrf[key] = rrf.get(key, 0.0) + 1.0 / (RRF_K + rank + 1)
+            if key not in chunks:
+                chunks[key] = hit
 
-        sorted_keys = sorted(rrf_scores, key=lambda k: rrf_scores[k], reverse=True)
         results = []
-        for key in sorted_keys[:top_k]:
-            hit = dict(chunk_map[key])
-            hit["rrf_score"] = round(rrf_scores[key], 6)
-            results.append(hit)
-
-        logger.debug("Hybrid — dense=%d bm25=%d merged=%d", len(dense_hits), len(bm25_hits), len(results))
+        for key in sorted(rrf, key=lambda k: rrf[k], reverse=True)[:top_k]:
+            h = dict(chunks[key])
+            h["rrf_score"] = round(rrf[key], 6)
+            results.append(h)
         return results
 
     def retrieve(self, query: str, top_k: int = TOP_K) -> list[dict]:
@@ -165,14 +154,12 @@ class VectorStore:
 
 
 # ═══════════════════════════════════════════════════════════════
-#  Cross-Encoder Reranker (local)
+#  Cross-Encoder Reranker (fastembed ONNX)
 # ═══════════════════════════════════════════════════════════════
 
 class Reranker:
-    """Local cross-encoder reranker — no API calls."""
-
     def __init__(self):
-        self.model = CrossEncoder(RERANK_MODEL, device="cpu")
+        self.model = TextCrossEncoder(model_name=RERANK_MODEL)
         logger.info("Cross-encoder reranker loaded — %s", RERANK_MODEL)
 
     def rerank(self, query: str, hits: list[dict],
@@ -180,8 +167,8 @@ class Reranker:
         if not hits:
             return hits
         try:
-            pairs = [(query, h["text"]) for h in hits]
-            scores = self.model.predict(pairs)
+            docs = [h["text"] for h in hits]
+            scores = list(self.model.rerank(query, docs))
             ranked = sorted(
                 zip(hits, scores), key=lambda x: x[1], reverse=True
             )[:top_n]
@@ -220,32 +207,22 @@ def _build_context(hits: list[dict]) -> str:
 
 
 class RAGPipeline:
-    """guard → hybrid retrieve → cross-encoder rerank → Groq generate → clean"""
-
     def __init__(self, vector_store: VectorStore, reranker: Reranker):
-        self.vs      = vector_store
+        self.vs       = vector_store
         self.reranker = reranker
         self.groq_client = Groq(api_key=GROQ_API_KEY.strip()) if GROQ_API_KEY else None
         logger.info("RAG pipeline ready — LLM=%s", GROQ_MODEL)
 
     def ask(self, question: str, chat_history: list[dict] | None = None) -> dict:
-        # 1. Input guard
         guard = check_input(question)
         if not guard.passed:
             return {"answer": guard.reason, "confidence": 0.0, "guardrail_blocked": True}
 
         query = guard.sanitized_input
-
-        # 2. Hybrid retrieval
-        hits = self.vs.retrieve(query, top_k=TOP_K)
-
-        # 3. Cross-encoder rerank
-        hits = self.reranker.rerank(query, hits, top_n=RERANK_TOP_N)
-
-        # 4. Build context
+        hits  = self.vs.retrieve(query, top_k=TOP_K)
+        hits  = self.reranker.rerank(query, hits, top_n=RERANK_TOP_N)
         context = _build_context(hits)
 
-        # 5. Generate
         if not self.groq_client:
             return {
                 "answer": "⚠️ GROQ_API_KEY is not configured.",
@@ -273,12 +250,6 @@ class RAGPipeline:
                 "guardrail_blocked": False,
             }
 
-        # 6. Output guard
         answer = clean_output(answer)
         confidence = check_grounding(answer, [h["text"] for h in hits])
-
-        return {
-            "answer": answer,
-            "confidence": round(confidence, 2),
-            "guardrail_blocked": False,
-        }
+        return {"answer": answer, "confidence": round(confidence, 2), "guardrail_blocked": False}
